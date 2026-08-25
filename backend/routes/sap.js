@@ -648,4 +648,201 @@ router.post('/sap/sync/despacho', async (req, res) => {
     }
 });
 
+// =========================================================================
+// RUTAS "AGRUPADORAS" — para que coincidan con los nombres que ya usan los
+// botones del frontend (hoja-asesor, hoja-ruta-cliente, panorama-comercial,
+// panorama-portafolio, planeacion-nogales llaman a TABLA='comercial';
+// hoja-sede llama a TABLA='sede'). Internamente disparan la sincronización
+// de varias tablas de una sola vez, reutilizando la misma conexión SAP.
+// =========================================================================
+
+// Helper: ejecuta el mismo bloque INSERT/UPDATE que las rutas individuales,
+// pero como función reutilizable, para no repetir código ni hacer HTTP
+// interno entre rutas del propio backend.
+async function syncClientesInterno(client) {
+    const urlOData = `${SAP_SERVICE_URL}/Clientes?$format=json`;
+    const respuesta = await axios.get(urlOData, {
+        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+    });
+    const registros = respuesta.data?.d?.results || [];
+    for (const r of registros) {
+        await client.query(
+            `INSERT INTO sap_clientes
+                (codigo_cliente, nombre, nit, ciudad, departamento,
+                 asesor, plazo_dias, cupo_credito, cupo_usado, sincronizado_en)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+             ON CONFLICT (codigo_cliente) DO UPDATE SET
+                nombre = EXCLUDED.nombre, nit = EXCLUDED.nit, ciudad = EXCLUDED.ciudad,
+                departamento = EXCLUDED.departamento, asesor = EXCLUDED.asesor,
+                plazo_dias = EXCLUDED.plazo_dias, cupo_credito = EXCLUDED.cupo_credito,
+                cupo_usado = EXCLUDED.cupo_usado, sincronizado_en = NOW()`,
+            [r.CodigoCliente, r.Nombre, r.Nit, r.Ciudad, r.Departamento,
+             r.Asesor, r.PlazoDias || null, r.CupoCredito || 0, r.CupoUsado || 0]
+        );
+    }
+    return registros.length;
+}
+
+async function syncVentasInterno(client, inicio, fin) {
+    const urlOData = `${SAP_SERVICE_URL}/Ventas?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
+    const respuesta = await axios.get(urlOData, {
+        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+    });
+    const registros = respuesta.data?.d?.results || [];
+    await client.query(`DELETE FROM sap_ventas WHERE periodo BETWEEN $1 AND $2`, [inicio, fin]);
+    for (const r of registros) {
+        await client.query(
+            `INSERT INTO sap_ventas
+                (codigo_cliente, codigo_articulo, descripcion, grupo, periodo, kg, valor_kilo, costo_kilo, peso_unitario)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (codigo_cliente, codigo_articulo, periodo) DO UPDATE SET
+                descripcion = EXCLUDED.descripcion, grupo = EXCLUDED.grupo, kg = EXCLUDED.kg,
+                valor_kilo = EXCLUDED.valor_kilo, costo_kilo = EXCLUDED.costo_kilo,
+                peso_unitario = EXCLUDED.peso_unitario, sincronizado_en = NOW()`,
+            [r.CodigoCliente, r.CodigoArticulo, r.Descripcion, r.Grupo, r.Periodo,
+             r.Kg || 0, r.ValorKilo, r.CostoKilo, r.PesoUnitario]
+        );
+    }
+    return registros.length;
+}
+
+async function syncCarteraInterno(client) {
+    const urlOData = `${SAP_SERVICE_URL}/Cartera?$format=json`;
+    const respuesta = await axios.get(urlOData, {
+        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+    });
+    const registros = respuesta.data?.d?.results || [];
+    for (const r of registros) {
+        await client.query(
+            `INSERT INTO sap_cartera (codigo_cliente, factura, fecha_factura, dias_vencido, valor, sincronizado_en)
+             VALUES ($1,$2,$3,$4,$5,NOW())
+             ON CONFLICT (codigo_cliente, factura) DO UPDATE SET
+                fecha_factura = EXCLUDED.fecha_factura, dias_vencido = EXCLUDED.dias_vencido,
+                valor = EXCLUDED.valor, sincronizado_en = NOW()`,
+            [r.CodigoCliente, r.Factura, r.FechaFactura, r.DiasVencido || 0, r.Valor || 0]
+        );
+    }
+    return registros.length;
+}
+
+async function syncInventarioInterno(client) {
+    const urlOData = `${SAP_SERVICE_URL}/Inventario?$format=json`;
+    const respuesta = await axios.get(urlOData, {
+        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+    });
+    const registros = respuesta.data?.d?.results || [];
+    for (const r of registros) {
+        await client.query(
+            `INSERT INTO sap_inventario (codigo_articulo, descripcion, grupo, stock_kg, sincronizado_en)
+             VALUES ($1,$2,$3,$4,NOW())
+             ON CONFLICT (codigo_articulo) DO UPDATE SET
+                descripcion = EXCLUDED.descripcion, grupo = EXCLUDED.grupo,
+                stock_kg = EXCLUDED.stock_kg, sincronizado_en = NOW()`,
+            [r.CodigoArticulo, r.Descripcion, r.Grupo, r.StockKg || 0]
+        );
+    }
+    return registros.length;
+}
+
+async function syncInventarioSedeInterno(client) {
+    const urlOData = `${SAP_SERVICE_URL}/InventarioSede?$format=json`;
+    const respuesta = await axios.get(urlOData, {
+        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+    });
+    const registros = respuesta.data?.d?.results || [];
+    for (const r of registros) {
+        await client.query(
+            `INSERT INTO sap_inventario_sede (sede, codigo_articulo, descripcion, stock_kg, stock_unidades, sincronizado_en)
+             VALUES ($1,$2,$3,$4,$5,NOW())
+             ON CONFLICT (sede, codigo_articulo) DO UPDATE SET
+                descripcion = EXCLUDED.descripcion, stock_kg = EXCLUDED.stock_kg,
+                stock_unidades = EXCLUDED.stock_unidades, sincronizado_en = NOW()`,
+            [r.Sede, r.CodigoArticulo, r.Descripcion, r.StockKg || 0, r.StockUnidades || 0]
+        );
+    }
+    return registros.length;
+}
+
+async function registrarLog(pool, tabla, registros, estado, detalleError) {
+    await pool.query(
+        `INSERT INTO sap_sync_log (tabla, ultima_sincronizacion, registros_actualizados, estado, detalle_error)
+         VALUES ($1, NOW(), $2, $3, $4)
+         ON CONFLICT (tabla) DO UPDATE SET
+            ultima_sincronizacion = EXCLUDED.ultima_sincronizacion,
+            registros_actualizados = EXCLUDED.registros_actualizados,
+            estado = EXCLUDED.estado, detalle_error = EXCLUDED.detalle_error`,
+        [tabla, registros, estado, detalleError]
+    ).catch(() => {});
+}
+
+// -------------------------------------------------------------------------
+// POST /api/sap/sync/comercial?inicio=YYYY-MM-DD&fin=YYYY-MM-DD
+// Usado por: hoja-asesor, hoja-ruta-cliente, panorama-comercial,
+// panorama-portafolio, planeacion-nogales. Sincroniza de un solo golpe:
+// clientes + ventas (del rango de fechas) + cartera + inventario general.
+// -------------------------------------------------------------------------
+router.post('/sap/sync/comercial', async (req, res) => {
+    const { inicio, fin } = req.query;
+    if (!inicio || !fin) {
+        return res.status(400).json({ error: 'Faltan las fechas de inicio o fin' });
+    }
+    if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
+        return res.status(500).json({
+            error: 'Variables de entorno de SAP no configuradas (SAP_SERVICE_URL, SAP_USER, SAP_PASS)'
+        });
+    }
+
+    const client = await pool.connect();
+    const resultado = { clientes: 0, ventas: 0, cartera: 0, inventario: 0 };
+    try {
+        await client.query('BEGIN');
+        resultado.clientes = await syncClientesInterno(client);
+        resultado.ventas = await syncVentasInterno(client, inicio, fin);
+        resultado.cartera = await syncCarteraInterno(client);
+        resultado.inventario = await syncInventarioInterno(client);
+        await client.query('COMMIT');
+
+        const total = resultado.clientes + resultado.ventas + resultado.cartera + resultado.inventario;
+        await registrarLog(pool, 'comercial', total, 'ok', null);
+
+        res.json({ ok: true, registros: total, detalle: resultado });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error al sincronizar comercial con SAP:', error.message);
+        await registrarLog(pool, 'comercial', 0, 'error', error.message);
+        res.status(500).json({ error: 'Error al consultar la información comercial en SAP' });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// POST /api/sap/sync/sede
+// Usado por: hoja-sede. Sincroniza inventario_sede.
+// -------------------------------------------------------------------------
+router.post('/sap/sync/sede', async (_req, res) => {
+    if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
+        return res.status(500).json({
+            error: 'Variables de entorno de SAP no configuradas (SAP_SERVICE_URL, SAP_USER, SAP_PASS)'
+        });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const registros = await syncInventarioSedeInterno(client);
+        await client.query('COMMIT');
+
+        await registrarLog(pool, 'sede', registros, 'ok', null);
+        res.json({ ok: true, registros });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error al sincronizar sede con SAP:', error.message);
+        await registrarLog(pool, 'sede', 0, 'error', error.message);
+        res.status(500).json({ error: 'Error al consultar el inventario por sede en SAP' });
+    } finally {
+        client.release();
+    }
+});
+
 export default router;
