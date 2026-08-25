@@ -48,7 +48,14 @@ async function seedAdminIfNeeded() {
   if (process.env.SEED_ON_BOOT !== 'true') return;
 
   const username = process.env.ADMIN_USERNAME || 'admin';
+  const usingDefaultPassword = !process.env.ADMIN_PASSWORD;
   const password = process.env.ADMIN_PASSWORD || '515T3M45';
+
+  if (usingDefaultPassword) {
+    console.warn('⚠️  ADMIN_PASSWORD no está definida: se está usando la contraseña ' +
+      'por defecto del código fuente. Define ADMIN_PASSWORD en las variables de ' +
+      'entorno de Render y vuelve a desplegar antes de usar esto en producción.');
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
