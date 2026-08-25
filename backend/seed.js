@@ -4,7 +4,13 @@ import {pool} from './db.js';
 dotenv.config();
 
 const username = process.env.ADMIN_USERNAME || 'admin';
+const usingDefaultPassword = !process.env.ADMIN_PASSWORD;
 const password = process.env.ADMIN_PASSWORD || '515T3M45';
+
+if (usingDefaultPassword) {
+  console.warn('⚠️  ADMIN_PASSWORD no está definida: se está usando la contraseña ' +
+    'por defecto del código fuente. Defínela antes de usar esto en producción.');
+}
 
 try {
   await pool.query(`
