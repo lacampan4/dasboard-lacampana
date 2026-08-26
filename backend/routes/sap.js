@@ -1,102 +1,109 @@
-import express from 'express';
+import { Router } from 'express';
 import axios from 'axios';
 
-const router = express.Router();
+const router = Router();
 
-// Credenciales desde las Variables de Entorno en Render
+// Credenciales desde las Variables de Entorno en Render/Vercel
 const SAP_SERVICE_URL = process.env.SAP_SERVICE_URL;
 const SAP_USER = process.env.SAP_USER;
 const SAP_PASS = process.env.SAP_PASS;
 
-router.get('/produccion', async (req, res) => {
-    const { inicio, fin } = req.query;
+// Reintentos automáticos en caso de fallo temporal
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000; // 2 segundos entre reintentos
 
-    if (!inicio || !fin) {
-        return res.status(400).json({ error: 'Faltan las fechas de inicio o fin' });
-    }
-
-    if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
-        return res.status(500).json({ error: 'Variables de entorno de SAP no configuradas' });
-    }
-
-    try {
-        const urlOData = `${SAP_SERVICE_URL}?$filter=Fecha ge datetime'${inicio}T00:00:00' and Fecha le datetime'${fin}T23:59:59'&$format=json`;
-
-        const respuestaSAP = await axios.get(urlOData, {
-            auth: {
-                username: SAP_USER,
-                password: SAP_PASS
-            },
-            timeout: 10000
-        });
-
-        res.json(respuestaSAP.data.d.results);
-    } catch (error) {
-        console.error('Error al conectar con SAP:', error.message);
-        res.status(500).json({ error: 'Error al consultar la información de SAP' });
-    }
-});
-
-export default router;
-
-import { Router } from 'express';
-import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
-import { pool } from '../db.js';
-
-const router = Router();
-
-function authRequired(req, res, next) {
-  const [scheme, token] = (req.headers.authorization || '').split(' ');
-  if (scheme !== 'Bearer' || !token) return res.status(401).json({message:'Token requerido.'});
+async function connectToSAP(url, retries = 0) {
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({message:'Sesión inválida o vencida.'});
+    console.log(`[SAP] Intentando conexión a: ${url.split('?')[0]} (intento ${retries + 1}/${MAX_RETRIES})`);
+    
+    const respuestaSAP = await axios.get(url, {
+      auth: {
+        username: SAP_USER,
+        password: SAP_PASS
+      },
+      timeout: 30000, // 30 segundos para dar más tiempo a SAP
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'PanoramaProduccion/1.0'
+      }
+    });
+
+    console.log('[SAP] Conexión exitosa');
+    return respuestaSAP;
+  } catch (error) {
+    const statusCode = error.response?.status;
+    const statusText = error.response?.statusText;
+    
+    console.error(`[SAP] Error: HTTP ${statusCode} ${statusText}`);
+    console.error(`[SAP] Mensaje: ${error.message}`);
+    
+    // Reintentar si es un error temporal (503, 502, timeout, etc.)
+    if (retries < MAX_RETRIES && (statusCode >= 500 || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT')) {
+      console.log(`[SAP] Reintentando en ${RETRY_DELAY}ms...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+      return connectToSAP(url, retries + 1);
+    }
+    
+    throw error;
   }
 }
 
-router.post('/login', async (req,res) => {
-  const {username,password} = req.body || {};
-  if (!username || !password) return res.status(400).json({message:'Usuario y contraseña son obligatorios.'});
+const getData = async (req, res) => {
+  const { inicio, fin } = req.query;
+
+  if (!inicio || !fin) {
+    return res.status(400).json({ error: 'Faltan las fechas de inicio o fin' });
+  }
+
+  if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
+    console.error('[SAP] Variables de entorno no configuradas');
+    return res.status(500).json({ 
+      error: 'No se pudo actualizar desde SAP: Credenciales no configuradas' 
+    });
+  }
 
   try {
-    const {rows} = await pool.query(
-      'SELECT id, username, password_hash, role, active FROM users WHERE username=$1 LIMIT 1',
-      [username]
-    );
-    const user = rows[0];
-    if (!user || !user.active) return res.status(401).json({message:'Usuario o contraseña incorrectos.'});
+    const urlOData = `${SAP_SERVICE_URL}?$filter=Fecha ge datetime'${inicio}T00:00:00' and Fecha le datetime'${fin}T23:59:59'&$format=json`;
+    
+    const respuestaSAP = await connectToSAP(urlOData);
+    
+    // Validar estructura de respuesta
+    if (!respuestaSAP.data || !respuestaSAP.data.d || !respuestaSAP.data.d.results) {
+      console.warn('[SAP] Respuesta con estructura inesperada');
+      return res.json([]);
+    }
 
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({message:'Usuario o contraseña incorrectos.'});
-
-    const token = jwt.sign(
-      {sub:user.id, username:user.username, role:user.role},
-      process.env.JWT_SECRET,
-      {expiresIn:'8h'}
-    );
-
-    res.json({token, user:{id:user.id, username:user.username, role:user.role}});
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({message:'Error al iniciar sesión.'});
+    res.json(respuestaSAP.data.d.results);
+  } catch (error) {
+    const statusCode = error.response?.status;
+    const statusText = error.response?.statusText;
+    
+    let mensaje = 'Error al consultar la información de SAP';
+    if (statusCode) {
+      mensaje = `No se pudo actualizar desde SAP: SAP respondió HTTP ${statusCode}`;
+    } else if (error.code === 'ECONNREFUSED') {
+      mensaje = 'No se pudo conectar con SAP: conexión rechazada';
+    } else if (error.code === 'ENOTFOUND') {
+      mensaje = 'No se pudo resolver el host de SAP';
+    }
+    
+    console.error(`[SAP] Respuesta al cliente: ${mensaje}`);
+    res.status(503).json({ error: mensaje });
   }
-});
+};
 
-router.get('/me', authRequired, async (req,res) => {
-  try {
-    const {rows} = await pool.query(
-      'SELECT id, username, role, active FROM users WHERE id=$1 LIMIT 1',
-      [req.user.sub]
-    );
-    const user = rows[0];
-    if (!user || !user.active) return res.status(401).json({message:'Usuario no disponible.'});
-    res.json({user});
-  } catch {
-    res.status(500).json({message:'Error al validar la sesión.'});
+// Rutas para GET /api/produccion (compatibilidad)
+router.get('/produccion', getData);
+
+// Rutas para POST /api/sap/sync/* (frontend esperado)
+router.post('/sap/sync/:tabla', async (req, res) => {
+  const { tabla } = req.params;
+  
+  if (tabla !== 'produccion') {
+    return res.status(400).json({ error: `Tabla no soportada: ${tabla}` });
   }
+  
+  await getData(req, res);
 });
 
 export default router;
