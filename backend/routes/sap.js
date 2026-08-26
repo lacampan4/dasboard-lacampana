@@ -1,24 +1,17 @@
-import express from 'express';
-import axios from 'axios';
-import https from 'https';
-
+const express = require('express');
 const router = express.Router();
+const axios = require('axios');
+const https = require('https');
 
-// Agente HTTPS para omitir validación estricta de TLS/certificados
+// Agente HTTPS para omitir validación estricta de TLS/certificados (igual que Postman)
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
-router.get('/test', async (req, res) => {
+// Función reutilizable para consultar SAP OData
+async function consultarSAP(req, res) {
   try {
-    // 1. Fechas desde la URL (?inicio=YYYY-MM-DD&fin=YYYY-MM-DD) o valores por defecto
+    // Tomar fechas desde req.query o asignarle valores por defecto
     const inicio = req.query.inicio || '2026-08-01';
     const fin = req.query.fin || '2026-08-25';
-
-    if (!inicio || !fin) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Fechas inválidas. Usa ?inicio=YYYY-MM-DD&fin=YYYY-MM-DD'
-      });
-    }
 
     const sapUrl = process.env.SAP_SERVICE_URL;
     const sapUser = process.env.SAP_USER;
@@ -27,7 +20,6 @@ router.get('/test', async (req, res) => {
     // Autenticación Basic Auth
     const authHeader = 'Basic ' + Buffer.from(`${sapUser}:${sapPass}`).toString('base64');
 
-    // Configuración de Axios adaptada a Postman
     const config = {
       method: 'get',
       url: sapUrl,
@@ -41,7 +33,7 @@ router.get('/test', async (req, res) => {
         '$filter': `Fecha_Factura ge datetime'${inicio}' and Fecha_Factura le datetime'${fin}'`,
         '$format': 'json'
       },
-      timeout: 10000
+      timeout: 15000
     };
 
     const response = await axios(config);
@@ -59,8 +51,6 @@ router.get('/test', async (req, res) => {
   } catch (error) {
     if (error.response) {
       console.error('[SAP Error] Status:', error.response.status);
-      console.error('[SAP Error] Data:', error.response.data);
-
       return res.status(502).json({
         ok: false,
         conexionSAP: true,
@@ -70,7 +60,6 @@ router.get('/test', async (req, res) => {
       });
     } else {
       console.error('[SAP Error] Network/Server:', error.message);
-
       return res.status(500).json({
         ok: false,
         conexionSAP: false,
@@ -79,7 +68,18 @@ router.get('/test', async (req, res) => {
       });
     }
   }
-});
+}
 
-// Exportación por defecto para ES Modules
-export default router;
+// 1. Escuchar en /api/sap/test
+router.get('/test', consultarSAP);
+
+// 2. Escuchar en /api/sap/ (raíz)
+router.get('/', consultarSAP);
+
+// 3. Escuchar en /api/sap/facturas
+router.get('/facturas', consultarSAP);
+
+// 4. Escuchar en /api/sap/costos (frecuente en tu frontend)
+router.get('/costos', consultarSAP);
+
+module.exports = router;
