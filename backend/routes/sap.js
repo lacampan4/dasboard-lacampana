@@ -974,4 +974,3 @@ router.post('/sap/sync/sede', async (_req, res) => {
 });
 
 export default router;
-
