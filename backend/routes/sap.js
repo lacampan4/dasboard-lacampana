@@ -45,6 +45,96 @@ function sapConfig() {
 }
 
 // ============================================================
+// REINTENTOS ANTE FALLOS TRANSITORIOS DE SAP (503, timeouts, etc.)
+// ============================================================
+
+const SAP_RETRY_INTENTOS = Number(process.env.SAP_RETRY_INTENTOS || 3);
+const SAP_RETRY_ESPERA_MS = Number(process.env.SAP_RETRY_ESPERA_MS || 3000);
+
+// Códigos HTTP que consideramos "temporales" y por lo tanto reintentables.
+// 503 = servicio no disponible (xsengine caído/reiniciando)
+// 502/504 = problemas de gateway/timeout intermedios
+const SAP_STATUS_REINTENTABLES = new Set([502, 503, 504]);
+
+// Códigos de error de red/axios que también vale la pena reintentar.
+const SAP_CODIGOS_REINTENTABLES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ESOCKETTIMEDOUT',
+  'ECONNABORTED'
+]);
+
+function esperar(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Llama a SAP con reintentos automáticos ante fallos transitorios.
+ * - Si la respuesta HTTP viene en SAP_STATUS_REINTENTABLES, reintenta.
+ * - Si axios lanza un error de red en SAP_CODIGOS_REINTENTABLES, reintenta.
+ * - Usa backoff simple: espera SAP_RETRY_ESPERA_MS × intento antes de cada reintento.
+ * - Al agotar los intentos, devuelve la última respuesta (o relanza el último error)
+ *   para que el código que llama maneje el caso exactamente igual que antes.
+ */
+async function sapGetConReintentos(url, config, {
+  intentos = SAP_RETRY_INTENTOS,
+  esperaMs = SAP_RETRY_ESPERA_MS,
+  etiqueta = 'SAP'
+} = {}) {
+  let ultimoError = null;
+  let ultimaRespuesta = null;
+
+  for (let intento = 1; intento <= intentos; intento++) {
+    try {
+      const response = await axios.get(url, config);
+
+      const esReintentable =
+        response.status >= 200 && response.status < 300
+          ? false
+          : SAP_STATUS_REINTENTABLES.has(response.status);
+
+      if (!esReintentable || intento === intentos) {
+        if (esReintentable && intento === intentos) {
+          console.warn(
+            `[${etiqueta}] HTTP ${response.status} tras ${intento} intento(s). Se agotaron los reintentos.`
+          );
+        }
+        return response;
+      }
+
+      ultimaRespuesta = response;
+
+      console.warn(
+        `[${etiqueta}] HTTP ${response.status} (intento ${intento}/${intentos}). ` +
+        `Reintentando en ${esperaMs * intento}ms…`
+      );
+
+      await esperar(esperaMs * intento);
+
+    } catch (error) {
+      ultimoError = error;
+
+      const esReintentable = SAP_CODIGOS_REINTENTABLES.has(error.code);
+
+      if (!esReintentable || intento === intentos) {
+        throw error;
+      }
+
+      console.warn(
+        `[${etiqueta}] Error de red ${error.code} (intento ${intento}/${intentos}). ` +
+        `Reintentando en ${esperaMs * intento}ms…`
+      );
+
+      await esperar(esperaMs * intento);
+    }
+  }
+
+  // No debería llegar aquí, pero por seguridad:
+  if (ultimaRespuesta) return ultimaRespuesta;
+  throw ultimoError;
+}
+
+// ============================================================
 // UTILIDADES
 // ============================================================
 
@@ -388,9 +478,10 @@ router.get('/sap/test', async (req, res) => {
     console.log(`[SAP TEST] GET ${url}`);
 
     const response =
-      await axios.get(
+      await sapGetConReintentos(
         url,
-        sapConfig()
+        sapConfig(),
+        { etiqueta: 'SAP TEST' }
       );
 
     const rows =
@@ -509,9 +600,10 @@ router.post(
         );
 
         const response =
-          await axios.get(
+          await sapGetConReintentos(
             url,
-            sapConfig()
+            sapConfig(),
+            { etiqueta: `SAP → NEON skip=${skip}` }
           );
 
         if (
