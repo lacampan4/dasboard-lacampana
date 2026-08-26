@@ -444,6 +444,70 @@ router.get('/sap/config', (_req, res) => {
 });
 
 // ============================================================
+// GET /api/sap/ping
+//
+// DIAGNÓSTICO MÍNIMO: no pide facturas ni filtra por fechas.
+// Solo pregunta si el xsengine/servicio de SAP responde en absoluto.
+//
+// Sirve para separar dos escenarios:
+//  - Si esto también da 503 → todo el motor xsengine está caído.
+//    No es un problema de cuántos datos pedimos, no hay nada
+//    que ajustar desde el dashboard. Hay que escalarlo con quien
+//    administra el servidor SAP.
+//  - Si esto responde bien pero /sap/test con fechas falla →
+//    el problema es más específico (el servicio Facturacion,
+//    el filtro, o el volumen de datos de esas fechas).
+// ============================================================
+
+router.get('/sap/ping', async (_req, res) => {
+  if (!SAP_USER || !SAP_PASS) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Faltan SAP_USER o SAP_PASS en Render.'
+    });
+  }
+
+  // Pedimos el documento de servicio raíz (sin entidad, sin filtro,
+  // sin $format=json): es la petición más liviana posible al xsengine.
+  const url = `${SAP_SERVICE_URL}/facturacion.xsodata/`;
+
+  try {
+    console.log(`[SAP PING] GET ${url}`);
+
+    const response = await sapGetConReintentos(
+      url,
+      { ...sapConfig(), timeout: 15000 },
+      { intentos: 1, etiqueta: 'SAP PING' }
+    );
+
+    return res.json({
+      ok: response.status >= 200 && response.status < 300,
+      httpStatusSAP: response.status,
+      url,
+      detalle:
+        typeof response.data === 'string'
+          ? response.data.slice(0, 500)
+          : response.data,
+      interpretacion:
+        response.status >= 200 && response.status < 300
+          ? 'El motor SAP responde. Si /sap/test con fechas falla, el problema es más específico del servicio Facturacion o del rango de fechas, no del motor en general.'
+          : `El motor SAP respondió HTTP ${response.status} incluso a la petición más mínima posible (sin filtros, sin datos). Esto confirma que el problema es del lado del servidor SAP/xsengine en su totalidad — no hay ajuste posible desde este dashboard.`
+    });
+
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      url,
+      error: 'Render no pudo consultar SAP.',
+      codigo: error.code || 'SAP_PING_ERROR',
+      detalleTecnico: error.message,
+      interpretacion:
+        'No se pudo ni siquiera establecer la conexión con el motor SAP. Esto confirma que el problema es de infraestructura del lado de SAP (servidor, red o motor caído), no de este dashboard.'
+    });
+  }
+});
+
+// ============================================================
 // GET /api/sap/test
 // PRUEBA SAP SIN GUARDAR EN NEON
 // ============================================================
