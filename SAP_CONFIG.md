@@ -1,7 +1,16 @@
 # Configuración de Conexión a SAP - Solución para Error HTTP 503
 
-## Problema Original
-El proyecto estaba retornando el error: `"No se pudo actualizar desde SAP: SAP respondió HTTP 503"`
+## Información del Sistema SAP
+
+**URL Base:** `https://170.239.154.46:4300`  
+**API:** `/api_campana26/facturacion.xsodata`  
+**Usuario:** `B1ADMIN`  
+**Host interno:** `NDB.n00.CAMPANADB02:4300`
+
+### Ejemplo de Consulta
+```
+GET https://170.239.154.46:4300/api_campana26/facturacion.xsodata/Facturacion?$filter=Fecha_Factura ge datetime'2026-08-01' and Fecha_Factura le datetime'2026-08-25'&$format=json
+```
 
 ## Problemas Identificados y Solucionados
 
@@ -14,13 +23,18 @@ El proyecto estaba retornando el error: `"No se pudo actualizar desde SAP: SAP r
 - ❌ Backend respondía en: `GET /api/produccion?inicio=...&fin=...`
 - ✅ Ambas rutas ahora funcionan correctamente
 
-### 3. **Timeout insuficiente**
+### 3. **Certificado HTTPS autofirmado de SAP**
+- ❌ SAP usa HTTPS con certificado autofirmado (IP interna)
+- ✅ Agregado `httpsAgent` que acepta certificados autofirmados
+- ✅ Manejo específico de errores de TLS
+
+### 4. **Timeout insuficiente**
 - ❌ Timeout original: 10 segundos
 - ✅ Timeout actualizado: 30 segundos
 - ✅ Agregados reintentos automáticos (3 intentos con 2 segundos entre ellos)
 
-### 4. **Manejo de errores mejorado**
-- ✅ Logs detallados de errores 503, 502, timeouts, etc.
+### 5. **Manejo de errores mejorado**
+- ✅ Logs detallados de errores 503, 502, timeouts, errores de TLS, etc.
 - ✅ Mensajes de error más descriptivos al cliente
 - ✅ Validación de estructura de respuesta SAP
 
@@ -33,9 +47,9 @@ En Render o Vercel, configura estas variables de entorno:
 DATABASE_URL=postgresql://usuario:contraseña@host/database
 
 # SAP OData Service
-SAP_SERVICE_URL=https://tu-sap-odata-endpoint/path/to/service   # Ej: https://sap.tucompania.com/odata/v4/Produccion
-SAP_USER=tu_usuario_sap
-SAP_PASS=tu_contraseña_sap
+SAP_SERVICE_URL=https://170.239.154.46:4300/api_campana26/facturacion.xsodata/Facturacion
+SAP_USER=B1ADMIN
+SAP_PASS=tu_contraseña_sap_aqui
 
 # JWT
 JWT_SECRET=tu_secret_seguro_aqui
@@ -52,20 +66,29 @@ CORS_ORIGIN=https://tu-frontend-domain.com
 ## Detalles de Implementación
 
 ### Reintentos Automáticos
-Cuando ocurren errores temporales (HTTP 5xx, timeouts, conexión rechazada):
+Cuando ocurren errores temporales (HTTP 5xx, timeouts, certificado):
 1. Primer intento
 2. Espera 2 segundos → Segundo intento
 3. Espera 2 segundos → Tercer intento
 4. Si falla, retorna error al cliente
 
+### Certificados Autofirmados
+El backend ahora acepta certificados HTTPS autofirmados de SAP gracias a:
+```javascript
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
+```
+
 ### Logs en el Servidor
 Para debugging, revisa los logs en tu plataforma de deployment:
 
 ```
-[SAP] Intentando conexión a: https://sap... (intento 1/3)
+[SAP] Intentando conexión a: https://170.239.154.46:4300/api_campana26/... (intento 1/3)
 [SAP] Error: HTTP 503 Service Unavailable
+[SAP] Código: 503
 [SAP] Reintentando en 2000ms...
-[SAP] Intentando conexión a: https://sap... (intento 2/3)
+[SAP] Intentando conexión a: https://170.239.154.46:4300/api_campana26/... (intento 2/3)
 [SAP] Conexión exitosa
 ```
 
@@ -81,8 +104,9 @@ echo $SAP_USER
 ### 2. Probar la Conexión Manualmente
 ```bash
 # Desde tu máquina local (con variables configuradas)
-curl -u "usuario_sap:contraseña_sap" \
-  "https://sap.com/odata/v4/Produccion?$filter=Fecha ge datetime'2024-01-01T00:00:00'&$format=json"
+# Nota: El certificado es autofirmado, así que curl necesita -k
+curl -k -u "B1ADMIN:contraseña" \
+  "https://170.239.154.46:4300/api_campana26/facturacion.xsodata/Facturacion?$filter=Fecha_Factura ge datetime'2026-08-01'&$format=json"
 ```
 
 ### 3. Verificar Logs en Deployment
@@ -100,8 +124,8 @@ El backend espera que SAP responda en este formato:
     "results": [
       {
         "id": "123",
-        "Fecha": "/Date(1703030400000)/",
-        "cantidad": 100,
+        "Fecha_Factura": "/Date(1703030400000)/",
+        "monto": 100000,
         ...
       }
     ]
@@ -114,21 +138,22 @@ Si SAP retorna un formato diferente, el backend lo adaptará automáticamente.
 ## Troubleshooting
 
 ### Error: "SAP respondió HTTP 503"
-1. Verifica que `SAP_SERVICE_URL`, `SAP_USER`, `SAP_PASS` estén configuradas
-2. Confirma que el servidor SAP está en línea
-3. Verifica que las credenciales de SAP sean correctas
-4. Revisa los logs en Render/Vercel para mensajes de error específicos
+1. ✅ Verifica que `SAP_SERVICE_URL`, `SAP_USER`, `SAP_PASS` estén configuradas
+2. ✅ Confirma que el servidor SAP está en línea: ping a `170.239.154.46:4300`
+3. ✅ Verifica que las credenciales de SAP sean correctas
+4. ✅ Revisa los logs en Render/Vercel para mensajes de error específicos
 
 ### Error: "conexión rechazada"
 - El host SAP no está disponible o la URL es incorrecta
-- Verifica la URL con `ping` o `curl`
+- Verifica que el servidor `170.239.154.46:4300` esté accesible desde Render/Vercel
+- Posible problema de firewall o red
 
-### Error: "no se pudo resolver el host"
-- El dominio SAP es inválido
-- Verifica la URL en tu navegador o con `nslookup`
+### Error: "certificado TLS inválido"
+- ✅ **RESUELTO** - El backend ahora acepta certificados autofirmados
+- Si aún falla, revisa si la IP ha cambiado
 
 ### Timeout (después de 30 segundos)
-- SAP está muy lento
+- SAP está muy lento o no responde
 - Verifica el status del servicio SAP
 - Considera aumentar el timeout en `backend/routes/sap.js` (línea: `timeout: 30000`)
 
@@ -139,6 +164,7 @@ Si SAP retorna un formato diferente, el backend lo adaptará automáticamente.
 - [x] Aumentado timeout de 10s a 30s
 - [x] Implementado sistema de reintentos (3 intentos)
 - [x] Agregadas rutas POST `/api/sap/sync/produccion`
+- [x] **[NUEVO]** Soporte para certificados HTTPS autofirmados
 - [x] Mejorado manejo de errores con logs detallados
 - [x] Validación de estructura de respuesta SAP
 
@@ -154,3 +180,5 @@ Si SAP retorna un formato diferente, el backend lo adaptará automáticamente.
 - [ ] Implementar rate limiting para SAP
 - [ ] Agregar métricas de disponibilidad de SAP
 - [ ] Notificaciones cuando SAP no esté disponible
+- [ ] Validar formato de fecha según lo que espera SAP
+

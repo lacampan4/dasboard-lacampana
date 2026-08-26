@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import axios from 'axios';
+import https from 'https';
 
 const router = Router();
 
@@ -12,6 +13,11 @@ const SAP_PASS = process.env.SAP_PASS;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 2000; // 2 segundos entre reintentos
 
+// Agente HTTPS que acepta certificados autofirmados (SAP en ambientes internos)
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
+
 async function connectToSAP(url, retries = 0) {
   try {
     console.log(`[SAP] Intentando conexión a: ${url.split('?')[0]} (intento ${retries + 1}/${MAX_RETRIES})`);
@@ -22,6 +28,7 @@ async function connectToSAP(url, retries = 0) {
         password: SAP_PASS
       },
       timeout: 30000, // 30 segundos para dar más tiempo a SAP
+      httpsAgent, // Acepta certificados autofirmados
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'PanoramaProduccion/1.0'
@@ -36,9 +43,10 @@ async function connectToSAP(url, retries = 0) {
     
     console.error(`[SAP] Error: HTTP ${statusCode} ${statusText}`);
     console.error(`[SAP] Mensaje: ${error.message}`);
+    console.error(`[SAP] Código: ${error.code}`);
     
     // Reintentar si es un error temporal (503, 502, timeout, etc.)
-    if (retries < MAX_RETRIES && (statusCode >= 500 || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT')) {
+    if (retries < MAX_RETRIES && (statusCode >= 500 || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' || error.code === 'ERR_TLS_CERT_ALTNAME_INVALID')) {
       console.log(`[SAP] Reintentando en ${RETRY_DELAY}ms...`);
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       return connectToSAP(url, retries + 1);
