@@ -5,7 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcrypt';
 import authRouter from './routes/auth.js';
-import sapRouter from './routes/sap.js'; // 1. IMPORTAMOS LA NUEVA RUTA DE SAP
+import sapRouter from './routes/sap.js';
+import driveRouter from './routes/drive.js';
 import { pool } from './db.js';
 
 dotenv.config();
@@ -30,7 +31,8 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
-app.use('/api', sapRouter); // 2. REGISTRAMOS LA RUTA (Queda disponible en /api/produccion)
+app.use('/api', sapRouter);
+app.use('/api/drive', driveRouter);
 
 // En local, el mismo backend sirve login.html y panorama.html.
 app.use(express.static(frontendPath));

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cargar Informe desde Google Drive</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .container {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 8px;
+            background: #f9f9f9;
+        }
+        h1 {
+            color: #333;
+        }
+        button {
+            background: #E10600;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+        button:hover {
+            background: #c50500;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .status.loading {
+            background: #e3f2fd;
+            color: #1976d2;
+            display: block;
+        }
+        .status.success {
+            background: #e8f5e9;
+            color: #388e3c;
+            display: block;
+        }
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            display: block;
+        }
+        .info {
+            background: #fff3e0;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            border-left: 4px solid #ff9800;
+        }
+        #dataPreview {
+            margin-top: 20px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background: #f5f5f5;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Cargar Informe desde Google Drive</h1>
+        
+        <div class="info">
+            <strong>Instrucciones:</strong>
+            <ol>
+                <li>Comparte tu archivo Google Sheets con acceso público (o configura con link)</li>
+                <li>Copia el ID del archivo (está en la URL: docs.google.com/spreadsheets/d/<strong>AQUI_VA_EL_ID</strong>)</li>
+                <li>Pega el ID en el input abajo</li>
+                <li>Haz clic en "Cargar Informe"</li>
+            </ol>
+        </div>
+
+        <div>
+            <label for="googleDriveId">ID del Google Sheets:</label><br>
+            <input 
+                type="text" 
+                id="googleDriveId" 
+                placeholder="1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P"
+                style="width: 100%; padding: 8px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px;"
+            >
+        </div>
+
+        <button id="btn-cargar-automatico">Cargar Informe</button>
+
+        <div id="status" class="status"></div>
+        <div id="dataPreview"></div>
+    </div>
+
+    <script>
+        const GOOGLE_DRIVE_ID_KEY = 'googleDriveId_saved';
+        
+        // Cargar ID guardado
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedId = localStorage.getItem(GOOGLE_DRIVE_ID_KEY);
+            if (savedId) {
+                document.getElementById('googleDriveId').value = savedId;
+            }
+        });
+
+        document.getElementById('btn-cargar-automatico').addEventListener('click', async () => {
+            const fileId = document.getElementById('googleDriveId').value.trim();
+            
+            if (!fileId) {
+                showStatus('error', '❌ Por favor ingresa un ID válido de Google Sheets');
+                return;
+            }
+
+            // Guardar para próxima vez
+            localStorage.setItem(GOOGLE_DRIVE_ID_KEY, fileId);
+
+            showStatus('loading', '⏳ Descargando archivo desde Google Drive...');
+            
+            try {
+                console.log(`Descargando archivo: ${fileId}`);
+                
+                // 1. Descargar CSV desde el backend
+                const downloadResponse = await fetch(`/api/drive/download?fileId=${fileId}`);
+                
+                if (!downloadResponse.ok) {
+                    throw new Error(`HTTP ${downloadResponse.status}`);
+                }
+
+                const csvText = await downloadResponse.text();
+                console.log(`CSV descargado: ${csvText.length} caracteres`);
+
+                // 2. Parsear CSV
+                showStatus('loading', '⏳ Parseando datos...');
+                
+                const parseResponse = await fetch('/api/drive/parse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ csv: csvText })
+                });
+
+                if (!parseResponse.ok) {
+                    throw new Error(`Error parseando: HTTP ${parseResponse.status}`);
+                }
+
+                const datos = await parseResponse.json();
+                console.log(`Datos parseados: ${datos.length} registros`);
+
+                // 3. Mostrar éxito
+                showStatus('success', `✅ Informe cargado exitosamente (${datos.length} registros)`);
+                
+                // 4. Mostrar preview
+                showDataPreview(datos);
+
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('error', `❌ Error al cargar: ${error.message}`);
+            }
+        });
+
+        function showStatus(type, message) {
+            const statusEl = document.getElementById('status');
+            statusEl.className = `status ${type}`;
+            statusEl.textContent = message;
+        }
+
+        function showDataPreview(datos) {
+            const preview = document.getElementById('dataPreview');
+            
+            if (!datos || datos.length === 0) {
+                preview.innerHTML = '<p>No hay datos para mostrar</p>';
+                return;
+            }
+
+            // Crear tabla HTML
+            const headers = Object.keys(datos[0]);
+            let html = '<h3>Vista previa de datos:</h3><table><thead><tr>';
+            
+            headers.forEach(h => {
+                html += `<th>${h}</th>`;
+            });
+            html += '</tr></thead><tbody>';
+            
+            // Mostrar máximo 10 filas
+            datos.slice(0, 10).forEach(row => {
+                html += '<tr>';
+                headers.forEach(h => {
+                    html += `<td>${row[h] || '-'}</td>`;
+                });
+                html += '</tr>';
+            });
+            
+            html += '</tbody></table>';
+            if (datos.length > 10) {
+                html += `<p><em>...y ${datos.length - 10} registros más</em></p>`;
+            }
+            
+            preview.innerHTML = html;
+        }
+    </script>
+</body>
+</html>
