@@ -21,6 +21,34 @@ const SAP_SERVICE_URL = process.env.SAP_SERVICE_URL;
 const SAP_USER = process.env.SAP_USER;
 const SAP_PASS = process.env.SAP_PASS;
 
+// -------------------------------------------------------------------------
+// NOMBRES DE SERVICIO/ENTIDAD POR MÓDULO — configurables por variable de
+// entorno para no tener que tocar código cada vez que se confirma el
+// nombre real de un servicio .xsodata en SAP (igual que ya se confirmó
+// "facturacion.xsodata/Facturacion"). Formato esperado en cada variable:
+// "<servicio>.xsodata/<Entidad>" (lo que va después de SAP_SERVICE_URL/).
+//
+// Mientras no se confirmen con el equipo de SAP, quedan con un valor por
+// defecto adivinado que probablemente no exista todavía — usa
+// GET /api/sap/debug/:servicio/:entidad (más abajo) para probar candidatos
+// reales antes de configurarlos aquí.
+// -------------------------------------------------------------------------
+const SAP_RUTA = {
+    clientes: process.env.SAP_RUTA_CLIENTES || 'Clientes.xsodata/Clientes',
+    ventas: process.env.SAP_RUTA_VENTAS || 'Ventas.xsodata/Ventas',
+    cartera: process.env.SAP_RUTA_CARTERA || 'Cartera.xsodata/Cartera',
+    inventario: process.env.SAP_RUTA_INVENTARIO || 'Inventario.xsodata/Inventario',
+    inventarioSede: process.env.SAP_RUTA_INVENTARIO_SEDE || 'InventarioSede.xsodata/InventarioSede',
+    // "Hoja de Ruta 6" en SAP probablemente sea UN solo servicio que ya trae
+    // clientes+ventas+cartera+inventario juntos, en vez de 4 separados.
+    // Si es así, configura SAP_RUTA_HOJA_RUTA_6 y usa ese único servicio en
+    // syncComercial() más abajo en lugar de las 4 llamadas separadas.
+    hojaRuta6: process.env.SAP_RUTA_HOJA_RUTA_6 || null,
+    // "Informe Producción Nogales" — probablemente el servicio real detrás
+    // de los paneles de Producción / Producción Diaria.
+    produccion: process.env.SAP_RUTA_PRODUCCION || 'InformeProduccionNogales.xsodata/InformeProduccionNogales'
+};
+
 // El servidor SAP se llama por IP directa (170.239.154.46) con un
 // certificado que Node no puede validar contra una CA pública (autofirmado
 // o emitido para el hostname interno NDB.n00.CAMPANADB02). Sin este agente,
@@ -80,6 +108,52 @@ router.get('/sap/debug/facturacion', async (req, res) => {
 });
 
 // -------------------------------------------------------------------------
+// GET /api/sap/debug/:servicio/:entidad?filtro=Campo+eq+'valor'
+// Diagnóstico GENÉRICO: prueba cualquier servicio/entidad candidato contra
+// SAP en vivo y devuelve el primer registro tal cual viene, para descubrir
+// nombres reales de servicio y de columnas antes de conectarlos a un botón.
+//
+// Ejemplos:
+//   /api/sap/debug/HojaRuta6/HojaRuta6
+//   /api/sap/debug/InformeProduccionNogales/InformeProduccionNogales?filtro=Fecha ge datetime'2026-08-01'
+//   /api/sap/debug/Clientes/Clientes
+//
+// Bórralo o protégelo detrás de auth cuando ya no lo necesites para explorar.
+// -------------------------------------------------------------------------
+router.get('/sap/debug/:servicio/:entidad', async (req, res) => {
+    const { servicio, entidad } = req.params;
+    const { filtro } = req.query;
+    if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
+        return res.status(500).json({
+            error: 'Variables de entorno de SAP no configuradas (SAP_SERVICE_URL, SAP_USER, SAP_PASS)'
+        });
+    }
+    try {
+        let url = `${SAP_SERVICE_URL}/${servicio}.xsodata/${entidad}?$format=json`;
+        if (filtro) url += `&$filter=${encodeURIComponent(filtro)}`;
+        const respuesta = await axios.get(url, { ...SAP_AXIOS_DEFAULTS, timeout: 15000 });
+        const registros = respuesta.data?.d?.results || [];
+        res.json({
+            ok: true,
+            url_consultada: url,
+            total: registros.length,
+            columnas: registros[0] ? Object.keys(registros[0]) : [],
+            primer_registro: registros[0] || null
+        });
+    } catch (error) {
+        const status = error.response?.status;
+        res.status(500).json({
+            error: 'Error al consultar SAP',
+            status_sap: status || null,
+            detalle: error.message,
+            // Si status_sap es 404, el nombre de servicio/entidad no existe.
+            // Si es 401, revisa SAP_USER/SAP_PASS.
+            url_intentada: `${SAP_SERVICE_URL}/${servicio}.xsodata/${entidad}`
+        });
+    }
+});
+
+// -------------------------------------------------------------------------
 // GET /api/produccion?inicio=YYYY-MM-DD&fin=YYYY-MM-DD
 // Lee de la tabla caché en Neon (sap_produccion). Esto es lo que deben
 // consumir los paneles del frontend: nunca golpean SAP directamente.
@@ -129,7 +203,11 @@ router.post('/sap/sync/produccion', async (req, res) => {
 
     const client = await pool.connect();
     try {
-        const urlOData = `${SAP_SERVICE_URL}?$filter=Fecha ge datetime'${inicio}T00:00:00' and Fecha le datetime'${fin}T23:59:59'&$format=json`;
+        // Antes esto llamaba a SAP_SERVICE_URL directamente (sin servicio ni
+        // entidad), por lo que nunca pudo funcionar. Ahora usa SAP_RUTA.produccion
+        // ("Informe Producción Nogales"), configurable con SAP_RUTA_PRODUCCION
+        // una vez confirmes el nombre real del servicio con el equipo de SAP.
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.produccion}?$filter=Fecha ge datetime'${inicio}T00:00:00' and Fecha le datetime'${fin}T23:59:59'&$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -222,7 +300,7 @@ router.post('/sap/sync/clientes', async (_req, res) => {
     const client = await pool.connect();
     try {
         // TODO: confirmar la URL exacta del servicio OData de clientes con SAP.
-        const urlOData = `${SAP_SERVICE_URL}/Clientes?$format=json`;
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.clientes}?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -321,7 +399,7 @@ router.post('/sap/sync/ventas', async (req, res) => {
     const client = await pool.connect();
     try {
         // TODO: confirmar URL y nombre de campos del servicio OData de ventas.
-        const urlOData = `${SAP_SERVICE_URL}/Ventas?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.ventas}?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -411,7 +489,7 @@ router.post('/sap/sync/cartera', async (_req, res) => {
     const client = await pool.connect();
     try {
         // TODO: confirmar URL y campos del servicio OData de cartera (cuentas por cobrar).
-        const urlOData = `${SAP_SERVICE_URL}/Cartera?$format=json`;
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.cartera}?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -490,7 +568,7 @@ router.post('/sap/sync/inventario', async (_req, res) => {
     const client = await pool.connect();
     try {
         // TODO: confirmar URL y campos del servicio OData de inventario/stock.
-        const urlOData = `${SAP_SERVICE_URL}/Inventario?$format=json`;
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.inventario}?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -573,7 +651,7 @@ router.post('/sap/sync/inventario-sede', async (_req, res) => {
     const client = await pool.connect();
     try {
         // TODO: confirmar URL y campos del servicio OData de stock por sede/almacén.
-        const urlOData = `${SAP_SERVICE_URL}/InventarioSede?$format=json`;
+        const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.inventarioSede}?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
             ...SAP_AXIOS_DEFAULTS,
@@ -732,7 +810,7 @@ router.post('/sap/sync/despacho', async (req, res) => {
 // pero como función reutilizable, para no repetir código ni hacer HTTP
 // interno entre rutas del propio backend.
 async function syncClientesInterno(client) {
-    const urlOData = `${SAP_SERVICE_URL}/Clientes?$format=json`;
+    const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.clientes}?$format=json`;
     const respuesta = await axios.get(urlOData, {
         ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
@@ -756,7 +834,7 @@ async function syncClientesInterno(client) {
 }
 
 async function syncVentasInterno(client, inicio, fin) {
-    const urlOData = `${SAP_SERVICE_URL}/Ventas?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
+    const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.ventas}?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
     const respuesta = await axios.get(urlOData, {
         ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
@@ -779,7 +857,7 @@ async function syncVentasInterno(client, inicio, fin) {
 }
 
 async function syncCarteraInterno(client) {
-    const urlOData = `${SAP_SERVICE_URL}/Cartera?$format=json`;
+    const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.cartera}?$format=json`;
     const respuesta = await axios.get(urlOData, {
         ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
@@ -798,7 +876,7 @@ async function syncCarteraInterno(client) {
 }
 
 async function syncInventarioInterno(client) {
-    const urlOData = `${SAP_SERVICE_URL}/Inventario?$format=json`;
+    const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.inventario}?$format=json`;
     const respuesta = await axios.get(urlOData, {
         ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
@@ -817,7 +895,7 @@ async function syncInventarioInterno(client) {
 }
 
 async function syncInventarioSedeInterno(client) {
-    const urlOData = `${SAP_SERVICE_URL}/InventarioSede?$format=json`;
+    const urlOData = `${SAP_SERVICE_URL}/${SAP_RUTA.inventarioSede}?$format=json`;
     const respuesta = await axios.get(urlOData, {
         ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
