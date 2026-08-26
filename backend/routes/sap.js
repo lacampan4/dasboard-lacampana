@@ -20,10 +20,11 @@ const SAP_SERVICE_URL = (
 const SAP_USER = process.env.SAP_USER;
 const SAP_PASS = process.env.SAP_PASS;
 
-// Host real utilizado por Postman
+// Host que funciona correctamente desde Postman
 const SAP_HOST = 'NDB.n00.CAMPANADB02:4300';
 
-// HTTPS SAP
+// El certificado de SAP se presenta por IP.
+// La conexión sigue siendo HTTPS, pero no validamos la CA.
 const sapHttpsAgent = new https.Agent({
   rejectUnauthorized: false
 });
@@ -81,7 +82,7 @@ function facturacionUrl(inicio, fin) {
 }
 
 // ============================================================
-// EXTRAER REGISTROS ODATA
+// EXTRAER DATOS ODATA
 // ============================================================
 
 function extractRows(data) {
@@ -89,12 +90,10 @@ function extractRows(data) {
 }
 
 // ============================================================
-// CONVERTIR FECHA SAP
+// FECHA SAP
 //
 // SAP devuelve:
 // /Date(1786406400000)/
-//
-// PostgreSQL necesita una fecha normal.
 // ============================================================
 
 function parseSapDate(value) {
@@ -109,20 +108,22 @@ function parseSapDate(value) {
   const match = String(value).match(/\/Date\((\d+)\)\//);
 
   if (match) {
-    return new Date(Number(match[1]));
+    const date = new Date(Number(match[1]));
+
+    return Number.isNaN(date.getTime())
+      ? null
+      : date;
   }
 
   const date = new Date(value);
 
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-
-  return date;
+  return Number.isNaN(date.getTime())
+    ? null
+    : date;
 }
 
 // ============================================================
-// CONVERTIR NÚMEROS
+// NÚMEROS
 // ============================================================
 
 function numberOrNull(value) {
@@ -142,7 +143,7 @@ function numberOrNull(value) {
 }
 
 // ============================================================
-// CONVERTIR ENTEROS
+// ENTEROS
 // ============================================================
 
 function integerOrNull(value) {
@@ -162,7 +163,7 @@ function integerOrNull(value) {
 }
 
 // ============================================================
-// MAPEAR REGISTRO SAP → NEON
+// MAPEAR SAP → NEON
 // ============================================================
 
 function mapFacturacion(row) {
@@ -187,7 +188,8 @@ function mapFacturacion(row) {
     fecha_factura:
       parseSapDate(row.Fecha_Factura),
 
-    plazo: row.Plazo ?? null,
+    plazo:
+      row.Plazo ?? null,
 
     cupo_credito:
       numberOrNull(row.Cupo_Credito),
@@ -195,12 +197,14 @@ function mapFacturacion(row) {
     cupo_usado:
       numberOrNull(row.Cupo_Usado),
 
-    asesor: row.Asesor ?? null,
+    asesor:
+      row.Asesor ?? null,
 
     meta_anual_asesor:
       numberOrNull(row.Meta_Anual_Asesor),
 
-    sede: row.Sede ?? null,
+    sede:
+      row.Sede ?? null,
 
     meta_anual_sede:
       numberOrNull(row.Meta_Anual_Sede),
@@ -247,7 +251,7 @@ function mapFacturacion(row) {
 }
 
 // ============================================================
-// ERROR INFO
+// ERROR SAP
 // ============================================================
 
 function errorInfo(error, response) {
@@ -300,7 +304,169 @@ function errorInfo(error, response) {
 }
 
 // ============================================================
-// GET /api/sap/config
+// UPSERT POR LOTES
+// ============================================================
+//
+// En lugar de:
+// 21.067 consultas
+//
+// hacemos aproximadamente:
+// 43 lotes de 500 registros.
+//
+// ============================================================
+
+async function upsertBatch(client, batch) {
+  if (!batch.length) {
+    return {
+      insertados: 0,
+      actualizados: 0
+    };
+  }
+
+  const columns = [
+    'sap_id',
+    'cliente',
+    'nit',
+    'ciudad',
+    'departamento',
+    'ciiu',
+    'numero_factura',
+    'fecha_factura',
+    'plazo',
+    'cupo_credito',
+    'cupo_usado',
+    'asesor',
+    'meta_anual_asesor',
+    'sede',
+    'meta_anual_sede',
+    'nombre_almacen',
+    'codigo_articulo',
+    'articulo',
+    'grupo',
+    'meta_anual_grupo',
+    'factura_paga_total',
+    'valor_pagado',
+    'valor_total_articulo',
+    'dias_mora',
+    'kilos',
+    'valor_kilo',
+    'costo_kilo',
+    'peso_unitario'
+  ];
+
+  const values = [];
+
+  const rowsSql = batch.map((row, rowIndex) => {
+    const placeholders = columns.map((_, columnIndex) => {
+      const parameterNumber =
+        rowIndex * columns.length +
+        columnIndex +
+        1;
+
+      return `$${parameterNumber}`;
+    });
+
+    values.push(
+      row.sap_id,
+      row.cliente,
+      row.nit,
+      row.ciudad,
+      row.departamento,
+      row.ciiu,
+      row.numero_factura,
+      row.fecha_factura,
+      row.plazo,
+      row.cupo_credito,
+      row.cupo_usado,
+      row.asesor,
+      row.meta_anual_asesor,
+      row.sede,
+      row.meta_anual_sede,
+      row.nombre_almacen,
+      row.codigo_articulo,
+      row.articulo,
+      row.grupo,
+      row.meta_anual_grupo,
+      row.factura_paga_total,
+      row.valor_pagado,
+      row.valor_total_articulo,
+      row.dias_mora,
+      row.kilos,
+      row.valor_kilo,
+      row.costo_kilo,
+      row.peso_unitario
+    );
+
+    return `(${placeholders.join(', ')})`;
+  });
+
+  const sql = `
+    INSERT INTO facturacion_sap (
+      ${columns.join(', ')}
+    )
+    VALUES
+      ${rowsSql.join(',\n')}
+
+    ON CONFLICT (sap_id)
+    DO UPDATE SET
+      cliente = EXCLUDED.cliente,
+      nit = EXCLUDED.nit,
+      ciudad = EXCLUDED.ciudad,
+      departamento = EXCLUDED.departamento,
+      ciiu = EXCLUDED.ciiu,
+      numero_factura = EXCLUDED.numero_factura,
+      fecha_factura = EXCLUDED.fecha_factura,
+      plazo = EXCLUDED.plazo,
+      cupo_credito = EXCLUDED.cupo_credito,
+      cupo_usado = EXCLUDED.cupo_usado,
+      asesor = EXCLUDED.asesor,
+      meta_anual_asesor = EXCLUDED.meta_anual_asesor,
+      sede = EXCLUDED.sede,
+      meta_anual_sede = EXCLUDED.meta_anual_sede,
+      nombre_almacen = EXCLUDED.nombre_almacen,
+      codigo_articulo = EXCLUDED.codigo_articulo,
+      articulo = EXCLUDED.articulo,
+      grupo = EXCLUDED.grupo,
+      meta_anual_grupo = EXCLUDED.meta_anual_grupo,
+      factura_paga_total = EXCLUDED.factura_paga_total,
+      valor_pagado = EXCLUDED.valor_pagado,
+      valor_total_articulo = EXCLUDED.valor_total_articulo,
+      dias_mora = EXCLUDED.dias_mora,
+      kilos = EXCLUDED.kilos,
+      valor_kilo = EXCLUDED.valor_kilo,
+      costo_kilo = EXCLUDED.costo_kilo,
+      peso_unitario = EXCLUDED.peso_unitario,
+      fecha_sincronizacion = CURRENT_TIMESTAMP
+
+    RETURNING
+      (xmax = 0) AS inserted;
+  `;
+
+  const result =
+    await client.query(
+      sql,
+      values
+    );
+
+  let insertados = 0;
+  let actualizados = 0;
+
+  for (const row of result.rows) {
+    if (row.inserted) {
+      insertados++;
+    } else {
+      actualizados++;
+    }
+  }
+
+  return {
+    insertados,
+    actualizados
+  };
+}
+
+// ============================================================
+// CONFIG
 // ============================================================
 
 router.get('/sap/config', (_req, res) => {
@@ -313,7 +479,8 @@ router.get('/sap/config', (_req, res) => {
 
     entidadApi: 'Facturacion',
 
-    sapServiceUrl: SAP_SERVICE_URL,
+    sapServiceUrl:
+      SAP_SERVICE_URL,
 
     endpointFacturacion:
       `${SAP_SERVICE_URL}/facturacion.xsodata/Facturacion`,
@@ -330,18 +497,12 @@ router.get('/sap/config', (_req, res) => {
 });
 
 // ============================================================
-// GET /api/sap/test
-//
-// SOLO prueba SAP.
-// NO guarda nada en Neon.
-//
-// Ejemplo:
-//
-// /api/sap/test?inicio=2026-08-01&fin=2026-08-25
+// TEST SAP
 // ============================================================
 
 router.get('/sap/test', async (req, res) => {
-  const { inicio, fin } = req.query;
+  const { inicio, fin } =
+    req.query;
 
   if (!validateDates(inicio, fin)) {
     return res.status(400).json({
@@ -359,10 +520,17 @@ router.get('/sap/test', async (req, res) => {
     });
   }
 
-  const url = facturacionUrl(inicio, fin);
+  const url =
+    facturacionUrl(
+      inicio,
+      fin
+    );
 
   try {
-    console.log(`[SAP TEST] GET ${url}`);
+
+    console.log(
+      `[SAP TEST] GET ${url}`
+    );
 
     const response =
       await axios.get(
@@ -371,7 +539,9 @@ router.get('/sap/test', async (req, res) => {
       );
 
     const rows =
-      extractRows(response.data);
+      extractRows(
+        response.data
+      );
 
     console.log(
       `[SAP TEST] HTTP ${response.status} · ${rows.length} registros`
@@ -393,19 +563,10 @@ router.get('/sap/test', async (req, res) => {
           `SAP respondió HTTP ${response.status}`,
 
         detalle:
-          typeof response.data === 'string'
-            ? response.data
-            : response.data,
+          response.data,
 
         headersSAP:
-          response.headers,
-
-        endpoint:
-          `${SAP_SERVICE_URL}/facturacion.xsodata/Facturacion`,
-
-        inicio,
-
-        fin
+          response.headers
       });
     }
 
@@ -444,22 +605,6 @@ router.get('/sap/test', async (req, res) => {
 
   } catch (error) {
 
-    const causa =
-      errorInfo(error);
-
-    console.error(
-      '[SAP TEST] ERROR:',
-      {
-        code:
-          error.code,
-
-        message:
-          error.message,
-
-        causa
-      }
-    );
-
     return res.status(502).json({
       ok: false,
 
@@ -472,33 +617,17 @@ router.get('/sap/test', async (req, res) => {
         error.code ||
         'SAP_REQUEST_ERROR',
 
-      causa,
+      causa:
+        errorInfo(error),
 
       detalleTecnico:
-        error.message,
-
-      endpoint:
-        `${SAP_SERVICE_URL}/facturacion.xsodata/Facturacion`,
-
-      inicio,
-
-      fin
+        error.message
     });
   }
 });
 
 // ============================================================
-// POST /api/sap/sync/hoja-ruta
-//
-// ESTE ES EL NUEVO FLUJO:
-//
-// SAP
-// ↓
-// Render
-// ↓
-// Neon
-//
-// NO usa localStorage.
+// SINCRONIZAR SAP → NEON
 // ============================================================
 
 router.post(
@@ -535,12 +664,6 @@ router.post(
       });
     }
 
-    const url =
-      facturacionUrl(
-        inicio,
-        fin
-      );
-
     const client =
       await pool.connect();
 
@@ -554,8 +677,18 @@ router.post(
         `[SAP → NEON] Iniciando sincronización ${inicio} → ${fin}`
       );
 
+      // ------------------------------------------------------
+      // CONSULTAR SAP
+      // ------------------------------------------------------
+
+      const url =
+        facturacionUrl(
+          inicio,
+          fin
+        );
+
       console.log(
-        `[SAP → NEON] Consultando SAP...`
+        '[SAP → NEON] Consultando SAP...'
       );
 
       const response =
@@ -576,10 +709,6 @@ router.post(
       console.log(
         `[SAP → NEON] Registros recibidos: ${rows.length}`
       );
-
-      // ------------------------------------------------------
-      // SAP ERROR
-      // ------------------------------------------------------
 
       if (
         response.status < 200 ||
@@ -602,7 +731,28 @@ router.post(
       }
 
       // ------------------------------------------------------
-      // TRANSACCIÓN NEON
+      // MAPEAR
+      // ------------------------------------------------------
+
+      const mappedRows =
+        rows
+          .map(mapFacturacion)
+          .filter(row => row.sap_id);
+
+      const omitidos =
+        rows.length -
+        mappedRows.length;
+
+      console.log(
+        `[SAP → NEON] Registros válidos: ${mappedRows.length}`
+      );
+
+      console.log(
+        `[SAP → NEON] Registros omitidos: ${omitidos}`
+      );
+
+      // ------------------------------------------------------
+      // TRANSACCIÓN
       // ------------------------------------------------------
 
       await client.query(
@@ -611,136 +761,51 @@ router.post(
 
       let insertados = 0;
       let actualizados = 0;
-      let omitidos = 0;
 
-      // ------------------------------------------------------
-      // UPSERT UNO POR UNO
-      // ------------------------------------------------------
+      const BATCH_SIZE = 500;
 
-      for (const row of rows) {
+      const totalBatches =
+        Math.ceil(
+          mappedRows.length /
+          BATCH_SIZE
+        );
 
-        const data =
-          mapFacturacion(row);
+      console.log(
+        `[SAP → NEON] Procesando ${totalBatches} lotes de máximo ${BATCH_SIZE} registros`
+      );
 
-        // Si SAP no tiene ID, no podemos identificar
-        // correctamente el registro.
-        if (!data.sap_id) {
-          omitidos++;
-          continue;
-        }
+      for (
+        let i = 0;
+        i < mappedRows.length;
+        i += BATCH_SIZE
+      ) {
 
-        const result =
-          await client.query(
-            `
-            INSERT INTO facturacion_sap (
-              sap_id,
-              cliente,
-              nit,
-              ciudad,
-              departamento,
-              ciiu,
-              numero_factura,
-              fecha_factura,
-              plazo,
-              cupo_credito,
-              cupo_usado,
-              asesor,
-              meta_anual_asesor,
-              sede,
-              meta_anual_sede,
-              nombre_almacen,
-              codigo_articulo,
-              articulo,
-              grupo,
-              meta_anual_grupo,
-              factura_paga_total,
-              valor_pagado,
-              valor_total_articulo,
-              dias_mora,
-              kilos,
-              valor_kilo,
-              costo_kilo,
-              peso_unitario,
-              fecha_sincronizacion
-            )
-            VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9,
-              $10, $11, $12, $13, $14, $15, $16, $17,
-              $18, $19, $20, $21, $22, $23, $24, $25,
-              $26, $27, $28, CURRENT_TIMESTAMP
-            )
-            ON CONFLICT (sap_id)
-            DO UPDATE SET
-              cliente = EXCLUDED.cliente,
-              nit = EXCLUDED.nit,
-              ciudad = EXCLUDED.ciudad,
-              departamento = EXCLUDED.departamento,
-              ciiu = EXCLUDED.ciiu,
-              numero_factura = EXCLUDED.numero_factura,
-              fecha_factura = EXCLUDED.fecha_factura,
-              plazo = EXCLUDED.plazo,
-              cupo_credito = EXCLUDED.cupo_credito,
-              cupo_usado = EXCLUDED.cupo_usado,
-              asesor = EXCLUDED.asesor,
-              meta_anual_asesor = EXCLUDED.meta_anual_asesor,
-              sede = EXCLUDED.sede,
-              meta_anual_sede = EXCLUDED.meta_anual_sede,
-              nombre_almacen = EXCLUDED.nombre_almacen,
-              codigo_articulo = EXCLUDED.codigo_articulo,
-              articulo = EXCLUDED.articulo,
-              grupo = EXCLUDED.grupo,
-              meta_anual_grupo = EXCLUDED.meta_anual_grupo,
-              factura_paga_total = EXCLUDED.factura_paga_total,
-              valor_pagado = EXCLUDED.valor_pagado,
-              valor_total_articulo = EXCLUDED.valor_total_articulo,
-              dias_mora = EXCLUDED.dias_mora,
-              kilos = EXCLUDED.kilos,
-              valor_kilo = EXCLUDED.valor_kilo,
-              costo_kilo = EXCLUDED.costo_kilo,
-              peso_unitario = EXCLUDED.peso_unitario,
-              fecha_sincronizacion = CURRENT_TIMESTAMP
-            RETURNING
-              (xmax = 0) AS inserted
-            `,
-            [
-              data.sap_id,
-              data.cliente,
-              data.nit,
-              data.ciudad,
-              data.departamento,
-              data.ciiu,
-              data.numero_factura,
-              data.fecha_factura,
-              data.plazo,
-              data.cupo_credito,
-              data.cupo_usado,
-              data.asesor,
-              data.meta_anual_asesor,
-              data.sede,
-              data.meta_anual_sede,
-              data.nombre_almacen,
-              data.codigo_articulo,
-              data.articulo,
-              data.grupo,
-              data.meta_anual_grupo,
-              data.factura_paga_total,
-              data.valor_pagado,
-              data.valor_total_articulo,
-              data.dias_mora,
-              data.kilos,
-              data.valor_kilo,
-              data.costo_kilo,
-              data.peso_unitario
-            ]
+        const batch =
+          mappedRows.slice(
+            i,
+            i + BATCH_SIZE
           );
 
-        if (
-          result.rows[0]?.inserted
-        ) {
-          insertados++;
-        } else {
-          actualizados++;
-        }
+        const batchNumber =
+          Math.floor(
+            i / BATCH_SIZE
+          ) + 1;
+
+        console.log(
+          `[SAP → NEON] Lote ${batchNumber}/${totalBatches} (${batch.length} registros)`
+        );
+
+        const result =
+          await upsertBatch(
+            client,
+            batch
+          );
+
+        insertados +=
+          result.insertados;
+
+        actualizados +=
+          result.actualizados;
       }
 
       // ------------------------------------------------------
@@ -752,7 +817,7 @@ router.post(
       );
 
       // ------------------------------------------------------
-      // CONTAR TOTAL NEON
+      // TOTAL NEON
       // ------------------------------------------------------
 
       const countResult =
@@ -764,26 +829,27 @@ router.post(
         );
 
       const totalNeon =
-        countResult.rows[0]?.total || 0;
+        countResult.rows[0]?.total ||
+        0;
 
       console.log(
-        `[SAP → NEON] Sincronización terminada`
+        '--------------------------------------------------'
       );
 
       console.log(
-        `[SAP → NEON] Insertados: ${insertados}`
+        `[SAP → NEON] INSERTADOS: ${insertados}`
       );
 
       console.log(
-        `[SAP → NEON] Actualizados: ${actualizados}`
+        `[SAP → NEON] ACTUALIZADOS: ${actualizados}`
       );
 
       console.log(
-        `[SAP → NEON] Omitidos: ${omitidos}`
+        `[SAP → NEON] OMITIDOS: ${omitidos}`
       );
 
       console.log(
-        `[SAP → NEON] Total Neon: ${totalNeon}`
+        `[SAP → NEON] TOTAL NEON: ${totalNeon}`
       );
 
       console.log(
@@ -807,6 +873,9 @@ router.post(
 
         registrosSAP:
           rows.length,
+
+        registrosValidos:
+          mappedRows.length,
 
         insertados,
 
@@ -834,7 +903,13 @@ router.post(
             error.code,
 
           message:
-            error.message
+            error.message,
+
+          detail:
+            error.detail,
+
+          hint:
+            error.hint
         }
       );
 
@@ -849,7 +924,13 @@ router.post(
           'SAP_NEON_SYNC_ERROR',
 
         detalle:
-          error.message
+          error.message,
+
+        detail:
+          error.detail || null,
+
+        hint:
+          error.hint || null
       });
 
     } finally {
@@ -860,9 +941,7 @@ router.post(
 );
 
 // ============================================================
-// GET /api/sap/neon/count
-//
-// Comprueba cuántos registros existen actualmente en Neon.
+// CONTAR REGISTROS EN NEON
 // ============================================================
 
 router.get(
@@ -913,13 +992,7 @@ router.get(
 );
 
 // ============================================================
-// GET /api/sap/neon/facturacion
-//
-// Consulta datos desde Neon.
-//
-// Ejemplo:
-//
-// /api/sap/neon/facturacion?inicio=2026-08-01&fin=2026-08-25
+// CONSULTAR FACTURACIÓN DESDE NEON
 // ============================================================
 
 router.get(
@@ -991,9 +1064,5 @@ router.get(
     }
   }
 );
-
-// ============================================================
-// EXPORTAR ROUTER
-// ============================================================
 
 export default router;
