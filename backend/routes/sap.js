@@ -1,5 +1,6 @@
 import express from 'express';
 import axios from 'axios';
+import https from 'https';
 import { pool } from '../db.js';
 
 const router = express.Router();
@@ -8,9 +9,75 @@ const router = express.Router();
 // Mientras no las tengas configuradas, /api/sap/sync devolverá 500 con un
 // mensaje claro, pero /api/produccion (lectura desde Neon) seguirá
 // funcionando con lo que ya se haya sincronizado o cargado manualmente.
+//
+// SAP_SERVICE_URL ahora es la URL BASE del namespace en el servidor SAP B1,
+// SIN el nombre del servicio .xsodata ni la entidad. Con el acceso ya
+// confirmado, en Render debe quedar así:
+//   SAP_SERVICE_URL = https://170.239.154.46:4300/api_campana26
+//   SAP_USER        = B1ADMIN
+//   SAP_PASS        = ********  (la contraseña real, no la publiques en el código)
+// Cada sync arma su propia ruta: `${SAP_SERVICE_URL}/<servicio>.xsodata/<Entidad>`.
 const SAP_SERVICE_URL = process.env.SAP_SERVICE_URL;
 const SAP_USER = process.env.SAP_USER;
 const SAP_PASS = process.env.SAP_PASS;
+
+// El servidor SAP se llama por IP directa (170.239.154.46) con un
+// certificado que Node no puede validar contra una CA pública (autofirmado
+// o emitido para el hostname interno NDB.n00.CAMPANADB02). Sin este agente,
+// axios falla con "self signed certificate" / "unable to verify". Es la
+// misma razón por la que el navegador probablemente pide "continuar de
+// todas formas" al abrir la URL directamente.
+const sapHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+const SAP_AXIOS_DEFAULTS = {
+    auth: { username: SAP_USER, password: SAP_PASS },
+    httpsAgent: sapHttpsAgent
+};
+
+// -------------------------------------------------------------------------
+// FACTURACIÓN — único servicio OData confirmado hasta ahora:
+//   GET {SAP_SERVICE_URL}/facturacion.xsodata/Facturacion
+//   Filtro real verificado: Fecha_Factura (datetime, formato 'YYYY-MM-DD')
+// Se usa para Hoja de Despacho (facturas del día) más abajo. Los demás
+// servicios (Clientes, Ventas, Cartera, Inventario, InventarioSede) siguen
+// siendo SUPOSICIONES de nombre — no se han confirmado con SAP todavía.
+// -------------------------------------------------------------------------
+function urlFacturacion(filtro) {
+    return `${SAP_SERVICE_URL}/facturacion.xsodata/Facturacion?$filter=${encodeURIComponent(filtro)}&$format=json`;
+}
+
+// -------------------------------------------------------------------------
+// GET /api/sap/debug/facturacion?inicio=YYYY-MM-DD&fin=YYYY-MM-DD
+// Endpoint temporal de diagnóstico: llama a SAP en vivo y devuelve el
+// primer registro TAL CUAL viene, para poder ver los nombres reales de
+// las columnas (CodigoCliente, Cliente, etc. son adivinanzas por ahora).
+// Bórralo (o protégelo detrás de auth) cuando ya no lo necesites.
+// -------------------------------------------------------------------------
+router.get('/sap/debug/facturacion', async (req, res) => {
+    const { inicio, fin } = req.query;
+    if (!inicio || !fin) {
+        return res.status(400).json({ error: 'Usa ?inicio=YYYY-MM-DD&fin=YYYY-MM-DD' });
+    }
+    if (!SAP_SERVICE_URL || !SAP_USER || !SAP_PASS) {
+        return res.status(500).json({
+            error: 'Variables de entorno de SAP no configuradas (SAP_SERVICE_URL, SAP_USER, SAP_PASS)'
+        });
+    }
+    try {
+        const filtro = `Fecha_Factura ge datetime'${inicio}' and Fecha_Factura le datetime'${fin}'`;
+        const url = urlFacturacion(filtro);
+        const respuesta = await axios.get(url, { ...SAP_AXIOS_DEFAULTS, timeout: 15000 });
+        const registros = respuesta.data?.d?.results || [];
+        res.json({
+            ok: true,
+            total: registros.length,
+            columnas: registros[0] ? Object.keys(registros[0]) : [],
+            primer_registro: registros[0] || null
+        });
+    } catch (error) {
+        console.error('Error al consultar Facturacion en SAP (debug):', error.message);
+        res.status(500).json({ error: 'Error al consultar SAP', detalle: error.message });
+    }
+});
 
 // -------------------------------------------------------------------------
 // GET /api/produccion?inicio=YYYY-MM-DD&fin=YYYY-MM-DD
@@ -65,7 +132,7 @@ router.post('/sap/sync/produccion', async (req, res) => {
         const urlOData = `${SAP_SERVICE_URL}?$filter=Fecha ge datetime'${inicio}T00:00:00' and Fecha le datetime'${fin}T23:59:59'&$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 10000
         });
 
@@ -158,7 +225,7 @@ router.post('/sap/sync/clientes', async (_req, res) => {
         const urlOData = `${SAP_SERVICE_URL}/Clientes?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -257,7 +324,7 @@ router.post('/sap/sync/ventas', async (req, res) => {
         const urlOData = `${SAP_SERVICE_URL}/Ventas?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -347,7 +414,7 @@ router.post('/sap/sync/cartera', async (_req, res) => {
         const urlOData = `${SAP_SERVICE_URL}/Cartera?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -426,7 +493,7 @@ router.post('/sap/sync/inventario', async (_req, res) => {
         const urlOData = `${SAP_SERVICE_URL}/Inventario?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -509,7 +576,7 @@ router.post('/sap/sync/inventario-sede', async (_req, res) => {
         const urlOData = `${SAP_SERVICE_URL}/InventarioSede?$format=json`;
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -595,11 +662,16 @@ router.post('/sap/sync/despacho', async (req, res) => {
 
     const client = await pool.connect();
     try {
-        // TODO: confirmar URL y campos del servicio OData equivalente a VF05N.
-        const urlOData = `${SAP_SERVICE_URL}/Despacho?$filter=Fecha eq datetime'${fecha}T00:00:00'&$format=json`;
+        // Entidad y campo de filtro CONFIRMADOS (Facturacion / Fecha_Factura).
+        // Los demás nombres de columna (r.CodigoCliente, r.Cliente, r.Asesor...)
+        // siguen siendo suposiciones: llama primero a
+        // GET /api/sap/debug/facturacion?inicio=FECHA&fin=FECHA para ver los
+        // nombres reales y ajustar solo la lista de abajo si no coinciden.
+        const filtro = `Fecha_Factura ge datetime'${fecha}' and Fecha_Factura le datetime'${fecha}'`;
+        const urlOData = urlFacturacion(filtro);
 
         const respuestaSAP = await axios.get(urlOData, {
-            auth: { username: SAP_USER, password: SAP_PASS },
+            ...SAP_AXIOS_DEFAULTS,
             timeout: 15000
         });
 
@@ -614,7 +686,7 @@ router.post('/sap/sync/despacho', async (req, res) => {
                      correo, codigo_articulo, texto_breve, grupo, cantidad, kilos)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
                 [
-                    r.Factura, r.Fecha, r.CodigoCliente, r.Cliente, r.Direccion, r.Asesor,
+                    r.Factura, r.Fecha_Factura, r.CodigoCliente, r.Cliente, r.Direccion, r.Asesor,
                     r.Correo, r.CodigoArticulo, r.TextoBreve, r.Grupo, r.Cantidad || 0, r.Kilos || 0
                 ]
             );
@@ -662,7 +734,7 @@ router.post('/sap/sync/despacho', async (req, res) => {
 async function syncClientesInterno(client) {
     const urlOData = `${SAP_SERVICE_URL}/Clientes?$format=json`;
     const respuesta = await axios.get(urlOData, {
-        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+        ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
     const registros = respuesta.data?.d?.results || [];
     for (const r of registros) {
@@ -686,7 +758,7 @@ async function syncClientesInterno(client) {
 async function syncVentasInterno(client, inicio, fin) {
     const urlOData = `${SAP_SERVICE_URL}/Ventas?$filter=Periodo ge datetime'${inicio}T00:00:00' and Periodo le datetime'${fin}T23:59:59'&$format=json`;
     const respuesta = await axios.get(urlOData, {
-        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+        ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
     const registros = respuesta.data?.d?.results || [];
     await client.query(`DELETE FROM sap_ventas WHERE periodo BETWEEN $1 AND $2`, [inicio, fin]);
@@ -709,7 +781,7 @@ async function syncVentasInterno(client, inicio, fin) {
 async function syncCarteraInterno(client) {
     const urlOData = `${SAP_SERVICE_URL}/Cartera?$format=json`;
     const respuesta = await axios.get(urlOData, {
-        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+        ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
     const registros = respuesta.data?.d?.results || [];
     for (const r of registros) {
@@ -728,7 +800,7 @@ async function syncCarteraInterno(client) {
 async function syncInventarioInterno(client) {
     const urlOData = `${SAP_SERVICE_URL}/Inventario?$format=json`;
     const respuesta = await axios.get(urlOData, {
-        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+        ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
     const registros = respuesta.data?.d?.results || [];
     for (const r of registros) {
@@ -747,7 +819,7 @@ async function syncInventarioInterno(client) {
 async function syncInventarioSedeInterno(client) {
     const urlOData = `${SAP_SERVICE_URL}/InventarioSede?$format=json`;
     const respuesta = await axios.get(urlOData, {
-        auth: { username: SAP_USER, password: SAP_PASS }, timeout: 15000
+        ...SAP_AXIOS_DEFAULTS, timeout: 15000
     });
     const registros = respuesta.data?.d?.results || [];
     for (const r of registros) {
